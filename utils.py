@@ -4,8 +4,7 @@ import cvxpy as cp
 import torch.nn.functional as F
 from datetime import datetime
 from prettytable import PrettyTable
-
-
+import glob
 
 import builtins as __builtin__
 def print(*args, **kwargs):
@@ -18,6 +17,53 @@ def print_update(msg, pbar=None):
         pbar.write(msg)
     else:
         print(msg)
+        
+        
+def anyvals(string, anyval):
+    substrings = string.split('_')
+    for si, substr in enumerate(substrings):
+        if any(substr.startswith(aval) for aval in anyval):
+            substrings[si] = substr.split('+')[0]+'*'
+    return '_'.join(substrings)
+
+
+def glob_escape_except(string, exp='*'):
+    estring = glob.escape(string)
+    for c in exp:
+        estring = estring.replace('['+c+']',c)
+    return estring
+
+
+def plot_shaded(*, x, y, ax, label, color):
+    m = np.nanmean(y,0)
+    e = np.nanstd(y,0)
+
+    #axis.plot(mse_m, label=exper, linewidth=1, alpha=.8)
+    ax.plot(x, m, '-', linewidth=1, alpha=1, label=label, color=color)
+    ax.fill_between(x, m-e, m+e,
+        alpha=.3, facecolor=color, #edgecolor='#3F7F4C', facecolor='#7EFF99',
+        linewidth=0, label=None)    
+
+
+# convert a list of lists of different lengths to np array
+def list2arr(lst):
+    pad = len(max(lst, key=len))
+    arr = np.array([i + [np.nan]*(pad-len(i)) for i in lst])
+    #np.array([np.pad(i, ((0,pad-len(i)),(0,0))) for i in lst])
+    return arr
+
+
+# reinitialize model parameters     
+def reset_model_parameters(m):
+    # check if m is iterable or if m has children
+    # base case: m is not iterable, then check if it can be reset; if yes --> reset; no --> do nothing
+
+    if hasattr(m, 'reset_parameters'):
+        m.reset_parameters()
+    else:
+        for l in m.children():
+            reset_model_parameters(l)
+
 
 def count_parameters(model, verbose=0):
     table = PrettyTable(["Modules", "Parameters"])
@@ -35,15 +81,19 @@ def count_parameters(model, verbose=0):
 
 
 def scale_to_range(x, constraints):
-#     return x
+    if constraints is None:
+        return x
+
+    device = x.device
+    
     lo, hi = constraints
     n,d = x.shape
     
     if not hasattr(lo, "__len__"): # hi is a scalar
-        lo *= torch.ones(n).view(-1)
+        lo *= torch.ones(n).view(-1).to(device)
         
     if not hasattr(hi, "__len__"): # hi is a scalar
-        hi *= torch.ones(n).view(-1)
+        hi *= torch.ones(n).view(-1).to(device)
         
     lo = lo.repeat(d).view((d,-1)).T
     hi = hi.repeat(d).view((d,-1)).T
@@ -52,7 +102,7 @@ def scale_to_range(x, constraints):
     return x_clip
 
 
-def init_p(pmax, nue, method='rand'):
+def init_p(pmax, nue, method='full'):
     full_init = np.tile(pmax,(nue,1)).T
     if method=='full':
         return full_init
@@ -62,22 +112,24 @@ def init_p(pmax, nue, method='rand'):
 
 
 def decouple_input(x, n):
-    de_pmax = x[:,-1]
-    if x.shape[1]==n**2+1:# without y_pred as start
-        de_h = (x[:,:-1]/de_pmax.view(*de_pmax.shape, 1)).view(-1, n , n )
-    elif x.shape[1]==n**2+n+1: # with y_pred as start
-        de_h = (x[:,n:-1]/de_pmax.view(*de_pmax.shape, 1)).view(-1, n , n )
-    else:
+    cpt1, cpt2, cpt3 = -(n+n**2+1), -(n**2+1), -1  # with/without y_pred as start
+    de_pmax = x[:,cpt3]
+    de_h = (x[:,cpt2:cpt3]/de_pmax.view(*de_pmax.shape, 1)).view(-1, n , n )
+    de_p = x[:,:cpt2]
+        
+    if x.shape[1]!=-cpt1 and x.shape[1]!=-cpt2 :
         raise ValueError('check size of input!')
-    return de_h, de_pmax
+    return de_p, de_h, de_pmax
         
 def f_wsee_torch(y_pred, x, mu, Pc, reduce='vector', **kwargs):
 #     with torch.no_grad():
     n = y_pred.shape[-1]
-    de_h, de_pmax = decouple_input(x, n)
+    _, de_h, de_pmax = decouple_input(x, n)
                             
 #     y_pred = torch.stack([torch.clamp(y_pred[pi], 0, pmax_) for pi,pmax_ in enumerate(de_x[:,-1])])
+#     print(y_pred)
     y_pred = scale_to_range(y_pred, [0, de_pmax.view(-1)])
+#     print(y_pred)
    
     s = de_h*y_pred.view((-1,1,n)) # (4,4) * (4,) --> (4,4)
     direct = s.diagonal(dim1=-2, dim2=-1)
@@ -92,6 +144,8 @@ def f_wsee_torch(y_pred, x, mu, Pc, reduce='vector', **kwargs):
         loss = torch.sum(ee)/len(ee)
     elif reduce=='sum':
         loss = torch.sum(ee)
+    elif reduce=='none':   
+        loss = ee
     else:
         raise ValueError
     return loss
@@ -140,95 +194,10 @@ def gradf(p, h, mu, Pc): # verified
 
 
 
-def inner_optim_helper(pt, h, mu, Pc):
-    
-    # grad r (without main diagonal)
-    s = h * pt
-
-    tmp = 1 + np.sum(s, axis=-1) # 1 + sum beta + a
-    tmp2 = tmp - np.diag(s)
-
-    fac = np.diag(s) / (tmp * tmp2)
-
-    beta = h.copy()
-    beta[np.diag_indices_from(beta)] = 0
-    grad = -(fac * beta.T).T
-
-    # r tilde constants
-    txp = 1.0/(mu * pt + Pc)
-
-    c1 = np.sum(grad * txp , axis=0)
-    c2 = -mu * np.log(np.diag(s)/tmp2+1)*txp**2
-
-    c = c1+c2
-
-    d = -c * pt    
-    
-    return txp, tmp, tmp2, c, d
-
-
-class grad_solver_1step(torch.nn.Module):
-    def __init__(self, pt, h, mu, Pc, Pmax, init='rand'):
-        super().__init__()
-        
-        self.h = torch.from_numpy(h).float()
-        self.mu = torch.tensor(mu).float() # check!!
-        self.Pc = torch.tensor(Pc).float()
-        self.Pmax = torch.empty(1).fill_(Pmax).float()
-        
-        txp, tmp, tmp2, c, d = inner_optim_helper(pt, h, mu, Pc)
-        
-        self.txp = torch.from_numpy(txp).float()
-        self.tmp = torch.from_numpy(tmp).float()
-        self.tmp2 = torch.from_numpy(tmp2).float()
-        self.c = torch.from_numpy(c).float()
-        self.d = torch.from_numpy(d).float()
-
-        # initialize 
-        self.pvar = torch.nn.Parameter(
-            torch.tensor(pt, requires_grad=True).float() # should be trainable parameter
-        )
-        if pt is None:
-            torch.nn.init.uniform_(self.pvar, a=0.0, b=self.Pmax)
-        else:# init=='full':
-            with torch.no_grad():
-                self.pvar.copy_(torch.from_numpy(pt))
-    
-        
-    def forward(self):
-        #obj_nl = cp.log(cp.multiply(np.diag(h)/tmp2, pvar)+1) @ txp
-        obj_nl = torch.log((torch.diag(self.h)/self.tmp2) * self.pvar + 1) @ self.txp
-        #obj_l  = cp.multiply(c, pvar)
-        obj_l  = self.c * self.pvar
-                
-        return -1*(obj_nl+obj_l+self.d) 
-    
-    def ee_eval(self, p):
-        return f_wsee(p, self.h.numpy(), self.mu, self.Pc)
-    
-
-def inner_optim_sgd(pt, h, mu, Pc, Pmax, eps=1e-8, max_iters=10, learning_rate=0.1):
-        
-    # solve innner optim pvar
-    model = grad_solver_1step(pt, h, mu, Pc, Pmax)
-    opt = torch.optim.SGD(model.parameters(), lr=learning_rate)
-
-    for i in range(max_iters):
-
-        loss = model()
-        opt.zero_grad()
-        loss.backward(torch.ones(h.shape[-1])) #vector loss
-        opt.step()
-
-        with torch.no_grad():
-            for param in model.parameters():
-                param.clamp_(0, Pmax)
-                
-    return model.pvar.detach().numpy()
-
 
 """
-pytorch implementation for batches
+pytorch implementation for batches 
+(FOR ORIGINAL IMPLEMENTATION: SEE SCA.PY)
 """
 
 # s = de_h*y_pred.view((-1,1,n)) # (4,4) * (4,) --> (4,4)
@@ -269,46 +238,6 @@ def inner_optim_helper_torch(pt, h, mu, Pc):
     return txp, tmp, tmp2, c, d
 
 
-# class grad_solver_1step_torch(torch.nn.Module):
-#     def __init__(self, pt, h, mu, Pc, Pmax, init='rand'):
-#         super().__init__()
-        
-#         self.h = h        
-#         self.txp, self.tmp, self.tmp2, self.c, self.d = inner_optim_helper_torch(pt, h, mu, Pc)
-
-#         # initialize 
-#         self.pvar = torch.nn.Parameter(
-#             pt.clone().detach().requires_grad_(True) # should be trainable parameter
-#         )
-# #         if pt is None:
-# #             torch.nn.init.uniform_(self.pvar, a=0.0, b=Pmax)    
-        
-#     def forward(self):
-#         direct = self.h.diagonal(dim1=-2, dim2=-1)
-#         obj_nl = torch.log((direct/self.tmp2) * self.pvar + 1) * self.txp
-#         obj_l  = self.c * self.pvar
-#         loss = -1*(obj_nl+obj_l+self.d) 
-#         return loss
-    
-
-# def inner_optim_sgd_torch(pt, h, mu, Pc, Pmax, eps=1e-8, max_iters=10, learning_rate=0.1):
-        
-#     # solve innner optim pvar
-#     model = grad_solver_1step_torch(pt, h, mu, Pc, Pmax)
-#     opt = torch.optim.SGD(model.parameters(), lr=learning_rate)
-
-#     for i in range(max_iters):
-
-#         loss = model()
-#         opt.zero_grad()
-#         loss.backward(torch.ones(loss.shape), retain_graph=True) #vector loss
-#         opt.step()
-
-#         with torch.no_grad():
-#             model.pvar.copy_(scale_to_range(model.pvar, [0,Pmax]))
-                
-#     return model.pvar.detach()
-
 def inner_optim_sgd_torch(pt, h, mu, Pc, Pmax, eps=1e-8, max_iters=10, learning_rate=0.1):
         
     pvar = torch.nn.Parameter(
@@ -338,22 +267,3 @@ def inner_optim_sgd_torch(pt, h, mu, Pc, Pmax, eps=1e-8, max_iters=10, learning_
     return pvar.detach()    
     
     
-def inner_optim_cvx(pt, h, mu, Pc, Pmax, **kwargs):
-    # e.g. kwargs = {'eps':1e-8, 'max_iters':SolverMaxIter, 'verbose':True}
-    
-    txp, tmp, tmp2, c, d = inner_optim_helper(pt, h, mu, Pc)
-
-    # ----- solve inner problem with cvxpy -----
-    pvar = cp.Variable(pt.shape, nonneg=True)
-    obj_nl = cp.log(cp.multiply(np.diag(h)/tmp2, pvar)+1) @ txp ##
-    obj_l  = cp.multiply(c, pvar)
-
-    objective = cp.Maximize(cp.sum(obj_nl + obj_l + d))
-    constraints = [0 <= pvar, pvar <= Pmax]
-    prob = cp.Problem(objective, constraints)
-    
-#     print('before solver:', pvar.value, pt)
-    prob.solve(requires_grad=True,**kwargs)#, eps=1e-8, max_iters=SolverMaxIter, verbose=True)
-#     print('after solver:', pvar.value, pt,'\n')
-    
-    return pvar.value

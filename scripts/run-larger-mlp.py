@@ -28,13 +28,15 @@ from trainer import Simple_Trainer, Simple_Trainer_G
 
 device = torch.device('cuda')
 
-num_ue = 4
-in_size = 1#num_ue**2 +1 #+ num_ue
-out_size = 1#num_ue
+num_ue = 10
+in_size = num_ue**2 +1 # + num_ue
+out_size = num_ue
 
 inner_architect = [
-    {'h_sizes': [64, 32, 32, 16, 8],
-     'activs': ['elu', 'relu', 'elu', 'relu', 'elu']},
+#     {'h_sizes': [32, 16, 8],
+#      'activs': ['elu', 'relu', 'elu']}#,
+    {'h_sizes': [16, 64, 32, 16, 8], 
+     'activs': ['elu', 'relu', 'elu', 'relu',  'elu']}#,        
 #     {'h_sizes': [128, 64, 32, 32, 20, 16, 8], 
 #      'activs': ['elu', 'relu', 'elu', 'relu', 'elu', 'relu',  'elu']},    
 #     {'h_sizes': [256, 256, 64, 64, 32, 32, 32, 32, 8], 
@@ -44,41 +46,45 @@ inner_architect = [
 k_fold = 2
 bs = 512
 
-num_outer_layers = [3]#[1,2,3,4,5,7,9] 
+num_outer_layers = [0]#[1,2,3,4,5,7,9] 
 
-learning_rate = 0.001
+learning_rate = 0.0005#1
 dropout = 0
 l2 = 1e-6
 epochs = 500
 save_freq = 50
 
-init = 'full'
+init = 'rand'
 rseed= 42
-loss_options= [['wsee']]#[['mse'],['wsee'], ['mse','wsee']]
-inner_optim='learned-gcn' 
-# inner_optim='vanilla' 
+loss_options= [['wsee']]
+# inner_optim='learned-mlp' 
+inner_optim='vanilla' 
 
-models = [USCA_GCN]#[GCN_ChPt]
-trainers = [Simple_Trainer_G]
+models = [MLP_ChPm]#[USCA_MLP] #[MLP_ChPm]
+trainers = [Simple_Trainer]
 
 #--- data---
 
-dfn_tr = PROJ_RT+'../../data/results_hataUrban_noSF.h5' # train / validation data
-X_tr, y_tr, cinfo_tr = ds.load_data(dfn_tr)
+dfn_tr = PROJ_RT+'../../data_my/channels-hataSuburban-10.h5' # train / validation data
+X_tr, y_tr, cinfo_tr = ds.load_data_unsup(dfn_tr)
 print(X_tr.shape, y_tr.shape)
 
-dfn_te = PROJ_RT+'../../data/results_hataUrban.h5' # test data
-X_te, y_te, cinfo_te = ds.load_data(dfn_te)
+dfn_te = PROJ_RT+'../../data_my/channels-hataUrban-10.h5' # test data
+X_te, y_te, cinfo_te = ds.load_data_unsup(dfn_te)
 print(X_te.shape, y_te.shape)
 
 # to torch tensor
 y_tr = torch.from_numpy(y_tr).float().to(device)
 y_te = torch.from_numpy(y_te).float().to(device)
 
-# add initial pt (max)
+# # add initial pt (max)
 attach_pt = lambda x: torch.from_numpy(np.hstack((init_p(x[:,-1], num_ue, method=init), x))).float().to(device)
 X_tr_ = attach_pt(X_tr)
 X_te_ = attach_pt(X_te)
+# X_tr_ = torch.from_numpy(X_tr).float().to(device)
+# X_te_ = torch.from_numpy(X_te).float().to(device)
+
+# assert in_size==X_tr_.shape[1]
 
 # move channel info to device
 dict_to_device = lambda x,dev: {k:v.to(dev) if isinstance(v, torch.Tensor) else v for k, v in x.items()}
@@ -118,7 +124,7 @@ for num_l in num_outer_layers:
                         learning_rate=learning_rate, l2=l2, pt_initial=init, loss_funcs= '+'.join(loss_which), 
                         random_state=rseed)
 
-                    save_path = PROJ_RT + 'runs_gcn/' + fix + f'/{k}/'
+                    save_path = PROJ_RT + 'runs_10_rand/' + fix + f'/{k}/'
                     if not os.path.isdir(save_path):
                         os.makedirs(save_path)
                     check_path = save_path + 'model.pt'
@@ -127,19 +133,27 @@ for num_l in num_outer_layers:
                     shutil.copy2(__file__, save_path)
                     print(save_path)
 
-#                     # instantiate model      
-                    model = MODEL(num_layers = num_l, in_size = in_size, out_size = out_size, **arc, 
-                                  channel_info = cinfo_tr, dropout = dropout, inner_optim = inner_optim).to(device)
-#                     model = MODEL(in_size = in_size, out_size = out_size, **arc, dropout=dropout).to(device)
+                    """
+                    instantiate model      
+                    """
+#                     # USCA-MLP:
+#                     model = MODEL(num_layers = num_l, in_size = in_size, out_size = out_size, **arc, 
+#                                   channel_info = cinfo_tr, dropout = dropout, inner_optim = inner_optim).to(device)
+#                     # USCA-GCN:
+#                     model = MODEL(num_layers = num_l, in_size = 1, out_size = 1, **arc, 
+#                                   channel_info = cinfo_tr, dropout = dropout, inner_optim = inner_optim).to(device)   
+                    # VANILLA MLP:
+                    model = MODEL(in_size = in_size, out_size = out_size, **arc, dropout=dropout).to(device)
+#                     # VANILLA GCN:
 #                     model = MODEL(in_size=1, out_size=1, **arc, channel_info = cinfo_tr).to(device)
+                    
                     num_params = count_parameters(model, 1)
-#                     raise
 
                     # optimization method
                     optimizer = torch.optim.Adam(model.parameters(), lr = learning_rate)
 
                     # construct the trainer and get loaders
-                    trainer = TRAINER(model, check_path, optimizer, resume = True, l2 = l2, display_step = 20)
+                    trainer = TRAINER(model, check_path, optimizer, resume = True, l2 = l2, display_step = 5, mode='UNSUP')
                     loaders = trainer.get_loaders(loaders_dict)
 
                     print([len(v) for v in loaders.values()])

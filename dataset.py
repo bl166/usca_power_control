@@ -12,9 +12,7 @@ def load_data(dpath):
         Hs = input["channel_to_noise_matched"]
         Plin = 10**(np.asarray(input['PdB'][...], dtype=float)/10)
         xopt = handle['xopt'][...].astype(float)
-        
-        cinfo = {'mu': input['PA inefficency'][...].item(),
-                 'Pc': input['Pc'][...].item() }
+        objval_opt = handle['objval'][...].astype(float) # or wsee 
         
         ns, nu, _ = Hs.shape # eg:(1000,4,4)
 
@@ -25,6 +23,11 @@ def load_data(dpath):
                              Plin.reshape(-1,1)])
             X.append( x1 )
             y.append( xopt[hidx] )
+            
+        cinfo = {'mu': input['PA inefficency'][...].item(),
+                 'Pc': input['Pc'][...].item(),
+                 'edge_index': edge_index,
+                 'objval_opt': objval_opt} # or wsee 
 
     y = np.concatenate((y))
     X = np.concatenate((X))
@@ -33,3 +36,34 @@ def load_data(dpath):
     
     return X, y, cinfo
 
+
+def load_data_unsup(dpath, **kwargs):
+    # parameters; ref: https://github.com/bmatthiesen/deep-EE-opt/blob/062093fde6b3c6edbb8aa83462165265deefce1a/src/globalOpt/run_wsee.py#L30
+    extract_args = lambda a, k: a if not k in kwargs else kwargs[k]
+    PdB = extract_args(np.array(range(-40,10+1,1)), 'PdB')
+    mu = extract_args(4.0, 'mu')
+    Pc = extract_args(1.0, 'Pc')
+    
+    X = []
+    with h5py.File(dpath, "r") as handle:
+        Hs = handle['input']["channel_to_noise_matched"]
+        Plin = 10**(PdB/10)
+        
+        ns, nu, _ = Hs.shape # eg:(1000,4,4)
+
+        for hidx in range(ns):
+            edge_index, h = dense_to_sparse(torch.from_numpy(Hs[hidx].astype(float)))
+            
+            x1 = np.hstack([(h.reshape((-1,1))*Plin).T, # -->(h1p1, h2p1, h3p1, ...)
+                             Plin.reshape(-1,1)])
+            X.append( x1 )
+            
+        cinfo = {'mu': mu,
+                 'Pc': Pc,
+                 'edge_index': edge_index} # or wsee 
+
+    X = np.concatenate((X))
+    X = X[~np.any(np.isnan(X),-1)]
+    y = np.full([X.shape[0], nu], np.nan)
+    
+    return X, y, cinfo

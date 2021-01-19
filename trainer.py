@@ -140,13 +140,15 @@ class _trainer(object):
         self.logger = SummaryWriter(self.cp+'-logs')
         
         # optional configs
+        extract_args = lambda a, k: a if not k in kwargs else kwargs[k]
         #self.l2 = 'l2' in kwargs and nn['l2'] or 0
-        self.l2 = kwargs['l2'] if 'l2' in kwargs.keys() else 0 # l2 regularization
-        self.ds = kwargs['display_step'] if 'display_step' in kwargs.keys() else np.inf
-        self.gc = kwargs['gradient_clipping'] if 'gradient_clipping' in kwargs.keys() else None 
+        self.l2 = extract_args( 0, 'l2' ) # l2 regularization
+        self.ds = extract_args( np.inf, 'display_step' )
+        self.gc = extract_args( None, 'gradient_clipping' )
         self.lr_scheduler = MultiStepLR(self.optimizer, milestones=kwargs['decay_step'][0], gamma=kwargs['decay_step'][1]) \
             if 'decay_step' in kwargs.keys() and kwargs['decay_step'] else None # learning rate scheduler
-        self.autostop = kwargs['auto_stop'] if 'auto_stop' in kwargs.keys() else np.inf
+        self.autostop = extract_args( np.inf, 'auto_stop' )
+        self.mode = extract_args( "SUP", 'mode' ) # 'SUP'ERVISED or 'UNSUP'ERVISED
         
         self.trackstop = 0
         self.stop = False
@@ -160,20 +162,15 @@ class _trainer(object):
     def save_json_logs(self):
         if len(self.logs):
             with open(self.jlogs_path, 'w') as fp:
-                try:
-                    json.dump(self.logs, fp)
-                    return True
-                except:
-                    return False  
+                json.dump(self.logs, fp)
+                return True 
         return False    
             
     def load_json_logs(self):
         if os.path.exists(self.jlogs_path):
             with open(self.jlogs_path, 'r') as fp:
-                try:
-                    self.logs = json.load(fp)
-                except:
-                    return False
+                self.logs = json.load(fp)
+                return False
         return False
         
     # ----------------------------------------
@@ -216,7 +213,7 @@ class _trainer(object):
             print(f"Resuming training from {res_path} at epoch {self.epoch} (jlogs:{jflag}) ...")
         else:
             print("Starting fresh at epoch 0 ...")
-
+ 
     # get data loaders
     def get_loaders(self, dict_loaders):
         # get optimal wsee
@@ -234,10 +231,10 @@ class _trainer(object):
         raise NotImplemented
         
     def add_reg_l2(self):
-        l2_reg = torch.tensor(0.).to(self.device)
+        l2_reg = 0.
         for param in self.model.parameters():
             l2_reg += torch.norm(param)
-        return self.l2 * l2_reg        
+        return self.l2 * l2_reg 
 
     
     # Evaluate performance
@@ -275,7 +272,7 @@ class _trainer(object):
                         continue
 
     # load data and labels
-    def data_handler(self, data):
+    def batch_data_handler(self, data):
         if isinstance(data, list):
             [d.to(self.device) for d in data]
             for dd in range(len(data)): # update x steps
@@ -304,177 +301,35 @@ class _trainer(object):
         self.bs = loader.batch_size
         n = max_nodes*self.bs*self.T
         return max_nodes, n
+    
+    
+    # loss and backprop step (in training and prediction)
+    def loss_handler(self, y_pred, y_true, x, criterion):
+        supv = self.mode[0].lower()=='s'
+        mse = torch.mean((y_pred-y_true)**2, dim=0) if supv else 0.
+        wsee = f_wsee_torch(y_pred, x, self.mu, self.Pc, 'vector')
 
+        loss = 0.
+        if 'mse' in criterion:
+            loss += mse
+        if 'wsee' in criterion:
+            loss -= wsee
+        if self.l2: # l2 regularization
+            loss += self.add_reg_l2()
+            
+        l = torch.mean(loss).item()
+        m = torch.mean(mse).item() if supv else np.mean(mse)
+        w = torch.sum(wsee).item()
+        return loss, (l, m, w)
+    
+    def opt_handler(self, loss):
+        self.optimizer.zero_grad()
+        loss.backward(torch.ones(self.nu).to(self.device)) #vector loss
+        if self.gc: # gradient clipping
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.gc)
+        self.optimizer.step()                
 
-# ----------------------------------------------
-# ---- USCA MLP Trainer (classification) ----
-# ----------------------------------------------
-
-class GCVAE_Trainer(_trainer):
-
-    # Train & test functions for a single epoch
-
-    def train(self, epoch, criterion, loader):
-        torch.cuda.empty_cache()
-
-        # get nodes and steps
-        max_nodes , n = self.calc_numbers(loader)
-
-        # training logs
-        trn_log = {'loss_%s'%k:[] for k in criterion.keys()} # kld/bce/mse loss
-        trn_log['loss'] = [] # entire loss
-
-        self.epoch = epoch
-        self.global_step = epoch*len(loader) if not self.global_step else self.global_step
-
-        # set to train mode
-        self.model.train()
-
-        with tqdm(loader, desc='Epoch#%d:'%epoch) as pbar:
-
-            count_b = 0
-
-            for data in pbar:
-                if len(data) <= 1:
-                    continue # for batchnorm the batchsize has to be greater than 1
-
-                self.optimizer.zero_grad()
-
-                data, y_true, A_coo = self.data_handler(data)
-
-                # p (prior) and q (post) are multi-var gaussian distributions
-                y_hat, (mu_q, sigma_q, mu_p, sigma_p)= self.model(data)
-
-                kld  = criterion['kld'](mu_q, sigma_q, mu_p, sigma_p)/n
-                bce  = criterion['bce'](y_hat, y_true)/n
-                rule = criterion['rule'](y_hat, A_coo, num_nodes=max_nodes)/n
-                loss = bce + kld + rule
-
-                if self.l2: # l2 regularization
-                    l2_reg = torch.tensor(0.).to(self.device)
-                    for param in self.model.parameters():
-                        l2_reg += torch.norm(param)
-                    loss += self.l2 * l2_reg
-
-                loss.backward()
-
-                if self.gc is not None: # gradient clipping
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.gc)
-                self.optimizer.step()
-
-                trn_log['loss'] += [loss.item()]
-                trn_log['loss_bce'] += [bce.item()]
-                trn_log['loss_kld'] += [kld.item()]
-                trn_log['loss_rule'] += [rule.item()]
-
-                count_b += 1
-
-                if not (self.global_step) % self.ds:
-                    # record the last step
-                    info = {k:v[-1] for k,v in trn_log.items() if v}
-                    self.logging(info, 'train')
-
-                    pbar.write('Train step {} at epoch {}: '.format(self.global_step, self.epoch) +
-                               ', '.join(['{}: {:.6f}'.format(k, np.mean(v[-count_b:])) for k,v in trn_log.items()]))
-
-                    count_b = 0
-
-                # update global step
-                self.global_step += 1
-
-        # if increment, reset loss etc. information
-        print('====> Epoch %d: Average training '%self.epoch +
-              ', '.join(['{}: {:.6f}'.format(k, np.sum(v)/len(loader)) for k,v in trn_log.items()]))
-
-
-    def predict(self, epoch, criterion=None, loader=None, save=False):
-
-        # has to be a valid dataloader
-        assert loader is not None
-
-        # calculate n from dataloader
-        max_nodes , n = self.calc_numbers(loader)
-
-        phase='Val' if save else 'Test'
-
-        self.model.eval()
-
-        # prediction
-        y_pr, y_gt, A_eidx = [],[],[]
-
-        # track the loss
-        if criterion:
-            trn_log = {'loss_%s'%k:0 for k in criterion.keys()} # kld/bce/mse loss
-            trn_log['loss'] = 0
-
-        with torch.no_grad():
-            with tqdm(loader, disable=1==len(loader)) as pbar:
-                for data in pbar:
-
-                    data, y_true, A_coo = self.data_handler(data)
-
-                    # p (prior) and q (post) are multi-var gaussian distributions
-
-                    y_hat, (mu_q, sigma_q, mu_p, sigma_p)= self.model(data)
-
-                    # append true and predicted labels to lists
-                    y_pr.append(y_hat.cpu().numpy().reshape((-1, max_nodes, self.T)))
-                    y_gt.append(y_true.cpu().numpy().reshape((-1, max_nodes, self.T)))
-                    A_eidx.append(A_coo.cpu().numpy())
-
-
-                    if criterion: # if given loss functions
-
-                        kld = criterion['kld'](mu_q, sigma_q, mu_p, sigma_p)/n
-                        bce = criterion['bce'](y_hat, y_true)/n
-                        rule = criterion['rule'](y_hat, A_coo, num_nodes=max_nodes)/n
-
-                        loss = bce + kld + rule
-
-                        if self.l2: # l2 regularization
-                            l2_reg = torch.tensor(0.).to(self.device)
-                            for param in self.model.parameters():
-                                l2_reg += torch.norm(param)
-                            loss += self.l2 * l2_reg
-
-                        trn_log['loss'] += loss.item()
-                        trn_log['loss_bce'] += bce.item()
-                        trn_log['loss_kld'] += kld.item()
-                        trn_log['loss_rule'] += rule.item()
-
-
-            y_pr = np.concatenate(y_pr)
-            y_gt = np.concatenate(y_gt)
-
-            # if criterion is given, we can track loss and save if best and needed;
-            # if criterion is not given, just return the true and predicted values
-            if criterion:
-
-                info = {k:v/len(loader) for k,v in trn_log.items()  if v}
-
-                print('====> %s set '%phase + ', '.join(['{}: {:.6}'.format(k,v) for k,v in info.items()]) )
-
-                if save: # if validation, save the model if it results in a new lowest error/loss
-                    self.logging(info, 'val')
-
-                    track = info['loss'] #test_err
-                    if track < self.track_minimize:
-                        # update min err track
-                        self.trackstop = 0
-                        self.track_minimize = track
-
-                        self.save(epoch) # save model
-                    else:
-                        self.trackstop += 1
-                        if self.trackstop > self.autostop:
-                            self.stop = True
-
-                else: # if test, do not save
-                    pass
-
-            return y_gt, y_pr, A_eidx
-
-
+    
         
         
 class Simple_Trainer(_trainer):
@@ -488,7 +343,7 @@ class Simple_Trainer(_trainer):
         self.bs = loader.batch_size # batch size
     
     # load data and labels
-    def data_handler(self, data):
+    def batch_data_handler(self, data):
         return data
 
     # simple logging via dict: self.logs
@@ -518,40 +373,25 @@ class Simple_Trainer(_trainer):
         
         # get number of users and batch size
         X_train, y_train, self.bs = loader
-        self.nu = y_train.shape[-1]
-        perm_i = np.random.permutation(y_train.shape[0])
-
+        ns, self.nu = y_train.shape
+        perm_i = np.random.permutation(ns)
+        
         # tracking loss and other stats
         running_loss, running_mse, running_wsee = 0,0,0
-        for i in range(len(perm_i)//self.bs):
+        for i in range(ns//self.bs):
             i_s, i_e = i*self.bs, (i+1)*self.bs
 
             y_true = y_train[perm_i[i_s:i_e]]
             x = X_train[perm_i[i_s:i_e]]
 
-            y_pred, gamma = self.model(x)
+            y_pred, gamma = self.model( x )     
+            
+            loss, (l,m,w) = self.loss_handler(y_pred.view(y_true.shape), y_true, x, criterion)
+            self.opt_handler(loss)  
 
-            mse = torch.mean((y_pred-y_true)**2, dim=0)
-            wsee = f_wsee_torch(y_pred, x, self.mu, self.Pc, 'vector')
-
-            loss = 0.
-            if 'mse' in criterion:
-                loss += mse
-            if 'wsee' in criterion:
-                loss -= wsee
-            if self.l2: # l2 regularization
-                loss += self.add_reg_l2()
-
-            self.optimizer.zero_grad()
-            loss.backward(torch.ones(self.nu).to(self.device)) #vector loss
-
-            if self.gc: # gradient clipping
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.gc)
-            self.optimizer.step()    
-
-            running_loss += torch.mean(loss).item()
-            running_mse += torch.mean(mse).item()
-            running_wsee += torch.sum(wsee).item()
+            running_loss += l
+            running_mse += m
+            running_wsee += w
             
             # update global step
             self.global_step += 1
@@ -563,37 +403,32 @@ class Simple_Trainer(_trainer):
         self.logging(trn_log, 'train')
 
         # if increment, reset loss etc. information
-        print_update('==> Epoch %d: training avg '%self.epoch +
-              ', '.join(['{}: {:.6f}'.format(k,v) for k,v in trn_log.items()]), pbar)
+        if not self.epoch%self.ds:
+            print_update('==> Epoch %d: training avg '%self.epoch +
+                  ', '.join(['{}: {:.6f}'.format(k,v) for k,v in trn_log.items()]), pbar)
 
             
     def predict(self, epoch, criterion=None, loader=None, save=False, pbar=None, return_serial=False):
         phase='val' if save else 'test'
         self.pbar = pbar
         
-        X, y, self.bs = loader
+        x, y, self.bs = loader
         self.nu = y.shape[-1]
         
         self.model.eval()
         # validation
-        y_p, gamma = self.model( X )        
-        
+        y_pred, gamma = self.model( x )
+        yp = y_pred if gamma is None else y_pred[-1]
+        ga = gamma if gamma is None else gamma[-1]
+                
         if criterion:
-            mse = torch.mean((y_p[-1]-y)**2).item()
-            wsee = f_wsee_torch(y_p[-1], X, self.mu, self.Pc, 'mean').item()
-        
-            val_log = {'loss': 0} # wsee/mse loss
-            if 'mse' in criterion:
-                val_log['mse'] = mse
-                val_log['loss'] += mse
-            if 'wsee' in criterion:
-                val_log['wsee'] = wsee
-                val_log['loss'] -= wsee/self.nu
-            if self.l2: # l2 regularization
-                val_log['loss'] += self.add_reg_l2()            
-
+            
+            loss, (l,m,w) = self.loss_handler(yp, y, x, criterion)
+            val_log = {'loss':l, 'mse':m, 'wsee':w} # wsee/mse loss
+            
             self.logging(val_log, phase)
-            print_update('==> %s set '%phase + ', '.join(['{}: {:.6}'.format(k,v) for k,v in val_log.items()]) , pbar)
+            if not self.epoch%self.ds:
+                print_update('==> %s set '%phase + ', '.join(['{}: {:.6}'.format(k,v) for k,v in val_log.items()]) , pbar)
             
             if save: 
                 # if validation, save the model if it results in a new lowest error/loss
@@ -609,176 +444,308 @@ class Simple_Trainer(_trainer):
                         self.stop = True
                         
             if return_serial:
-                return (y_p, gamma), y    
+                return (y_pred, gamma), y    
             else:
-                return (y_p[-1], gamma[-1]), y    
+                return (yp, ga), y    
         
         
-        
-# ---------------------------
-# ---- USCA MLP Trainer  ----
-# ---------------------------
+class Simple_Trainer_G(Simple_Trainer):
+    """
+    UNDER CONSTRUCTION!!!!!!!
+    load all data first; not using pytorch's dataloader
+    """
+    def __init__(self, model, check_path, optimizer, resume=True, **kwargs):
+        super(Simple_Trainer_G, self).__init__(model, check_path, optimizer, resume, **kwargs)
+        self.ei = self.model.ei
 
-class MLP_Trainer(_trainer):
-    
-    # returns the numbers 
-    def calc_numbers(self, loader):
-        self.nu = loader.dataset[0][1].shape[-1] # number of users
-        self.bs = loader.batch_size # batch size
-    
     # load data and labels
-    def data_handler(self, data):
-        return data
+    def batch_data_handler(self, data):
+        #edge_weight_batch = data[:,self.nu:-1].reshape(-1) 
+        edge_weight_batch = (data[:,self.nu:-1]/data[:,-1].view(-1,1)).reshape(-1) 
+        y_init =  data[:,:self.nu].reshape(-1,1) # inital signals (p_init)
+        y_constr = data[:,:self.nu].reshape(-1,1) # upper power constraint (p_max)
+        return (y_init, y_constr), self.edge_index_batch, edge_weight_batch
+    
+    # edge index for mini batches
+    def edge_info_proc(self, edge_index, nu, bs):
+        shift = torch.Tensor(
+                np.array([np.arange(bs)*nu,]*nu**2).T.reshape(-1)
+            ).repeat(1, 2).view(2,-1).long().to(edge_index.device) 
+        edge_index_batch = edge_index.repeat(1, bs)+shift #edge_index_tr=edge_index_va
+        return edge_index_batch        
+    
+    # training preperation; set configs; return x_train, y_train and index (permutated)
+    def training_prep(self, epoch, loader):
+        torch.cuda.empty_cache()
+        self.model.train() # set to train mode
+        self.epoch = epoch
+        self.global_step = epoch*len(loader) if not self.global_step else self.global_step
+        
+        # get number of users and batch size
+        X_train, y_train, self.bs = loader
+        if y_train is not None:
+            ns, self.nu = y_train.shape
+        else:
+            ns = X_train.shape[0]
+            self.nu = np.floor((X_train.shape[1]-1)**.5).astype(int)
+        perm_i = np.random.permutation(ns)
+        
+        # edge index for mini batches
+        self.edge_index_batch = self.edge_info_proc(self.ei, self.nu, self.bs)   
+        
+        return X_train, y_train, perm_i
+    
 
     # Train & test functions for a single epoch
     def train(self, epoch, criterion, loader, pbar=None):
-        torch.cuda.empty_cache()
-        
-        # get number of users and batch size
-        self.calc_numbers(loader)
-        self.ds = min(len(loader),self.ds)
-    
-        # training logs
-        trn_log = {'%s'%k:[] for k in criterion} # wsee/mse loss
-        trn_log['loss'] = [] # entire loss
+        self.pbar = pbar # simple progress bar handling
+        x_train, y_train, perm_i = self.training_prep(epoch, loader)
 
-        self.epoch = epoch
-        self.global_step = epoch*len(loader) if not self.global_step else self.global_step
-
-        # set to train mode
-        self.model.train()
-
-        # handle progress bar
-        if pbar is None:
-            pb_handler = (trange(len(loader), desc='Epoch#%d:'%epoch), True)
-        else:
-            pbar.set_description('Epoch#%d:'%epoch)
-            pb_handler = (pbar, False)
-        self.pbar = pb_handler[0]
-
-        count_b = 0
-        for data in loader:
-#                 if len(data) <= 1:
-#                     continue # for batchnorm the batchsize has to be greater than 1
-
-            self.optimizer.zero_grad()
-
-            x, y_true = self.data_handler(data)
-
-            y_pred, gamma = self.model(x)
-
-            mse = torch.mean((y_pred-y_true)**2, dim=0)
-            wsee = f_wsee_torch(y_pred, x, self.mu, self.Pc, 'vector')
-
-            loss = 0.
-            if 'mse' in criterion:
-                loss += mse
-            if 'wsee' in criterion:
-                loss -= wsee
-            if self.l2: # l2 regularization
-                loss += self.add_reg_l2()
-
-            loss.backward(torch.ones(self.nu).to(self.device)) #vector loss
-
-            if self.gc is not None: # gradient clipping
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.gc)
-            self.optimizer.step()
-
-            trn_log['loss'] += [torch.mean(loss).item()]
-            trn_log['mse'] += [torch.mean(mse).item()]
-            trn_log['wsee'] += [torch.sum(wsee).item()]
-
-            count_b += 1
+        # tracking loss and other stats
+        running_loss, running_mse, running_wsee = 0,0,0
+        for i in range(len(perm_i)//self.bs):
             
-            if not (1+self.global_step) % self.ds:
-                # record the last step
-                info = {k:v[-1] for k,v in trn_log.items() if v}
-                self.logging(info, 'train')
-                
-                print_update('Train step {} at epoch {}: '.format(self.global_step, self.epoch) +
-                           ', '.join(['{}: {:.6f}'.format(k, np.mean(v[-count_b:])) for k,v in trn_log.items()]),
-                            pb_handler[0])
-                pb_handler[0].update(count_b)
-                
-                count_b = 0
+            # get batch
+            idx = perm_i[(i*self.bs) : ((i+1)*self.bs)]
+            y_true = y_train[idx]
+            x = x_train[idx]
+            
+            # format inputs and propogate forward
+            inputs = self.batch_data_handler(x)
+            y_pred, gamma = self.model(*inputs)
+            
+            # training step back prop
+            loss, (l,m,w) = self.loss_handler(y_pred.view(y_true.shape), y_true, x, criterion)
+            self.opt_handler(loss)
 
+            running_loss += l
+            running_mse += m
+            running_wsee += w
+            
             # update global step
             self.global_step += 1
+            
+        # check if stuck at a local minimum; if yes, reset the parameters
+        if running_wsee==0:
+            reset_model_parameters(self.model)
+
+        # training logs
+        trn_log = {'loss': running_loss/(i+1),
+                   'mse': running_mse/(i+1),
+                   'wsee': running_wsee/(i+1)}
+        self.logging(trn_log, 'train')
 
         # if increment, reset loss etc. information
-        print_update('====> Epoch %d: Average training '%self.epoch +
-              ', '.join(['{}: {:.6f}'.format(k, np.sum(v)/len(loader)) for k,v in trn_log.items()]), pb_handler[0])
+        if not self.epoch%self.ds:
+            print_update('==> Epoch %d: training avg '%self.epoch +
+                  ', '.join(['{}: {:.6f}'.format(k,v) for k,v in trn_log.items()]), pbar)
 
-        if pb_handler[-1]:
-            pb_handler[0].close()
             
     def predict(self, epoch, criterion=None, loader=None, save=False, pbar=None):
-        
-        # has to be a valid dataloader
-        assert loader is not None
-
-        # calculate n from dataloader
-        self.calc_numbers(loader)
-        phase='Val' if save else 'Test'
-
-        # track the loss
-        if criterion:
-            trn_log = {'%s'%k:0 for k in criterion} # wsee/mse loss
-            trn_log['loss'] = 0
-
-        # prediction
-        y_pr, y_gt = [],[]
-
+        # predict in single batch
+        phase='val' if save else 'test'
+        self.pbar = pbar
         self.model.eval()
-        with torch.no_grad():
-            for data in loader:
-                x, y_true = self.data_handler(data)
-                yp, gamma = self.model( x )
+        
+        x, y, bs = loader
+        nu = y.shape[-1]
+        
+        # ------ validation # HERE ASSUME: SAME GRAPH TOPOLOGY!!! (self.ei DOES NOT CHANGE)
+        self.edge_index_batch = self.edge_info_proc(self.ei, nu, bs) 
+        inputs = self.batch_data_handler(x)
+        yp, gamma = self.model(*inputs)
+        # ------
+        
+        if isinstance(yp, list):
+            yp = yp[-1]
+        
+        _, (l,m,w) = self.loss_handler(yp.view(y.shape), y, x, criterion)
+        val_log = {'loss':l, 'mse':m, 'wsee':w} # wsee/mse loss
+
+        self.logging(val_log, phase)
+        if not self.epoch%self.ds:
+            print_update('==> %s set '%phase + ', '.join(['{}: {:.6}'.format(k,v) for k,v in val_log.items()]) , pbar)
+
+        if save: 
+            # if validation, save the model if it results in a new lowest error/loss
+            track = val_log['loss'] #test_err
+            if track < self.track_minimize:
+                # update min err track
+                self.trackstop = 0
+                self.track_minimize = track
+                self.save(epoch) # save model
+            else:
+                self.trackstop += 1
+                if self.trackstop > self.autostop:
+                    self.stop = True
+
+        return yp, y    
+
+    
+# # --------------------------------------------------------------
+# # ---- USCA MLP Trainer (USES PYTORCH DATALOADER; OBSOLETE) ----
+# # --------------------------------------------------------------
+
+# class MLP_Trainer(_trainer):
+    
+#     # returns the numbers 
+#     def calc_numbers(self, loader):
+#         self.nu = loader.dataset[0][1].shape[-1] # number of users
+#         self.bs = loader.batch_size # batch size
+    
+#     # load data and labels
+#     def batch_data_handler(self, data):
+#         return data
+
+#     # Train & test functions for a single epoch
+#     def train(self, epoch, criterion, loader, pbar=None):
+#         torch.cuda.empty_cache()
+        
+#         # get number of users and batch size
+#         self.calc_numbers(loader)
+#         self.ds = min(len(loader),self.ds)
+    
+#         # training logs
+#         trn_log = {'%s'%k:[] for k in criterion} # wsee/mse loss
+#         trn_log['loss'] = [] # entire loss
+
+#         self.epoch = epoch
+#         self.global_step = epoch*len(loader) if not self.global_step else self.global_step
+
+#         # set to train mode
+#         self.model.train()
+
+#         # handle progress bar
+#         if pbar is None:
+#             pb_handler = (trange(len(loader), desc='Epoch#%d:'%epoch), True)
+#         else:
+#             pbar.set_description('Epoch#%d:'%epoch)
+#             pb_handler = (pbar, False)
+#         self.pbar = pb_handler[0]
+
+#         count_b = 0
+#         for data in loader:
+# #                 if len(data) <= 1:
+# #                     continue # for batchnorm the batchsize has to be greater than 1
+
+#             self.optimizer.zero_grad()
+
+#             x, y_true = self.batch_data_handler(data)
+
+#             y_pred, gamma = self.model(x)
+
+#             mse = torch.mean((y_pred-y_true)**2, dim=0)
+#             wsee = f_wsee_torch(y_pred, x, self.mu, self.Pc, 'vector')
+
+#             loss = 0.
+#             if 'mse' in criterion:
+#                 loss += mse
+#             if 'wsee' in criterion:
+#                 loss -= wsee
+#             if self.l2: # l2 regularization
+#                 loss += self.add_reg_l2()
+
+#             loss.backward(torch.ones(self.nu).to(self.device)) #vector loss
+
+#             if self.gc is not None: # gradient clipping
+#                 nn.utils.clip_grad_norm_(self.model.parameters(), self.gc)
+#             self.optimizer.step()
+
+#             trn_log['loss'] += [torch.mean(loss).item()]
+#             trn_log['mse'] += [torch.mean(mse).item()]
+#             trn_log['wsee'] += [torch.sum(wsee).item()]
+
+#             count_b += 1
+            
+#             if not (1+self.global_step) % self.ds:
+#                 # record the last step
+#                 info = {k:v[-1] for k,v in trn_log.items() if v}
+#                 self.logging(info, 'train')
                 
-                y_pr.append(yp[-1])
-                y_gt.append(y_gt)
+#                 print_update('Train step {} at epoch {}: '.format(self.global_step, self.epoch) +
+#                            ', '.join(['{}: {:.6f}'.format(k, np.mean(v[-count_b:])) for k,v in trn_log.items()]),
+#                             pb_handler[0])
+#                 pb_handler[0].update(count_b)
                 
-                mse = torch.mean((yp[-1]-y_true)**2).item()
-                wsee = f_wsee_torch(yp[-1], x, self.mu, self.Pc, 'mean').item()
+#                 count_b = 0
 
-                if criterion: # if given loss functions
-                    trn_log['mse'] += mse
-                    trn_log['wsee'] += wsee
-                    if 'mse' in criterion:
-                        trn_log['loss'] += mse
-                    if 'wsee' in criterion:
-                        trn_log['loss'] -= wsee/self.nu
-                    if self.l2: # l2 regularization
-                        trn_log['loss'] += self.add_reg_l2()
+#             # update global step
+#             self.global_step += 1
 
-            y_pr = np.concatenate(y_pr)
-            y_gt = np.concatenate(y_gt)
+#         # if increment, reset loss etc. information
+#         print_update('====> Epoch %d: Average training '%self.epoch +
+#               ', '.join(['{}: {:.6f}'.format(k, np.sum(v)/len(loader)) for k,v in trn_log.items()]), pb_handler[0])
 
-            # if criterion is given, we can track loss and save if best and needed;
-            # if criterion is not given, just return the true and predicted values
-            if criterion:
+#         if pb_handler[-1]:
+#             pb_handler[0].close()
+            
+#     def predict(self, epoch, criterion=None, loader=None, save=False, pbar=None):
+        
+#         # has to be a valid dataloader
+#         assert loader is not None
 
-                info = {k:v/len(loader) for k,v in trn_log.items()  if v}
+#         # calculate n from dataloader
+#         self.calc_numbers(loader)
+#         phase='Val' if save else 'Test'
 
-                print_update('====> %s set '%phase + ', '.join(['{}: {:.6}'.format(k,v) for k,v in info.items()]) , pbar)
+#         # track the loss
+#         if criterion:
+#             trn_log = {'%s'%k:0 for k in criterion} # wsee/mse loss
+#             trn_log['loss'] = 0
 
-                if save: # if validation, save the model if it results in a new lowest error/loss
-                    self.logging(info, 'val')
+#         # prediction
+#         y_pr, y_gt = [],[]
 
-                    track = info['loss'] #test_err
-                    if track < self.track_minimize:
-                        # update min err track
-                        self.trackstop = 0
-                        self.track_minimize = track
+#         self.model.eval()
+#         with torch.no_grad():
+#             for data in loader:
+#                 x, y_true = self.batch_data_handler(data)
+#                 yp, gamma = self.model( x )
+                
+#                 y_pr.append(yp[-1])
+#                 y_gt.append(y_gt)
+                
+#                 mse = torch.mean((yp[-1]-y_true)**2).item()
+#                 wsee = f_wsee_torch(yp[-1], x, self.mu, self.Pc, 'mean').item()
 
-                        self.save(epoch) # save model
-                    else:
-                        self.trackstop += 1
-                        if self.trackstop > self.autostop:
-                            self.stop = True
+#                 if criterion: # if given loss functions
+#                     trn_log['mse'] += mse
+#                     trn_log['wsee'] += wsee
+#                     if 'mse' in criterion:
+#                         trn_log['loss'] += mse
+#                     if 'wsee' in criterion:
+#                         trn_log['loss'] -= wsee/self.nu
+#                     if self.l2: # l2 regularization
+#                         trn_log['loss'] += self.add_reg_l2()
+                        
+#             y_pr = np.concatenate(y_pr)
+#             y_gt = np.concatenate(y_gt)
 
-                else: # if test, do not save
-                    self.logging(info, 'test')
+#             # if criterion is given, we can track loss and save if best and needed;
+#             # if criterion is not given, just return the true and predicted values
+#             if criterion:
 
-            return y_gt, y_pr
+#                 info = {k:v/len(loader) for k,v in trn_log.items()  if v}
+
+#                 print_update('====> %s set '%phase + ', '.join(['{}: {:.6}'.format(k,v) for k,v in info.items()]) , pbar)
+
+#                 if save: # if validation, save the model if it results in a new lowest error/loss
+#                     self.logging(info, 'val')
+
+#                     track = info['loss'] #test_err
+#                     if track < self.track_minimize:
+#                         # update min err track
+#                         self.trackstop = 0
+#                         self.track_minimize = track
+
+#                         self.save(epoch) # save model
+#                     else:
+#                         self.trackstop += 1
+#                         if self.trackstop > self.autostop:
+#                             self.stop = True
+
+#                 else: # if test, do not save
+#                     self.logging(info, 'test')
+
+#             return y_gt, y_pr
         

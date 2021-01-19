@@ -23,6 +23,129 @@ import numpy as np
 import cvxpy as cp
 from utils import *
 
+"""
+OPTIMIZATION HELPER FUNCTIONS
+"""
+
+def inner_optim_helper(pt, h, mu, Pc):   
+    # grad r (without main diagonal)
+    s = h * pt
+
+    degr = np.sum(s, axis=-1)
+    diag = np.diag(s)
+    
+    tmp = 1 + degr # 1 + sum beta + a
+    tmp2 = degr - diag + 1
+    
+    fac = diag / (tmp * tmp2)
+       
+    beta = h.copy()
+    beta[np.diag_indices_from(beta)] = 0
+    grad = -(fac * beta.T).T
+
+    # r tilde constants
+    txp = 1.0/(mu * pt + Pc)
+
+    c1 = np.sum(grad * txp , axis=0)
+    c2 = -mu * np.log(diag/tmp2+1)*txp**2
+
+    c = c1+c2
+
+    d = -c * pt    
+    
+    return txp, tmp, tmp2, c, d
+
+
+class grad_solver_1step(torch.nn.Module):
+    def __init__(self, pt, h, mu, Pc, Pmax, init='rand'):
+        super().__init__()
+        
+        self.h = torch.from_numpy(h).float()
+        self.mu = torch.tensor(mu).float() # check!!
+        self.Pc = torch.tensor(Pc).float()
+        self.Pmax = torch.empty(1).fill_(Pmax).float()
+        
+        txp, tmp, tmp2, c, d = inner_optim_helper(pt, h, mu, Pc)
+        
+        self.txp = torch.from_numpy(txp).float()
+        self.tmp = torch.from_numpy(tmp).float()
+        self.tmp2 = torch.from_numpy(tmp2).float()
+        self.c = torch.from_numpy(c).float()
+        self.d = torch.from_numpy(d).float()
+
+        # initialize 
+        self.pvar = torch.nn.Parameter(
+            torch.tensor(pt, requires_grad=True).float() # should be trainable parameter
+        )
+        if pt is None:
+            torch.nn.init.uniform_(self.pvar, a=0.0, b=self.Pmax)
+        else:# init=='full':
+            with torch.no_grad():
+                self.pvar.copy_(torch.from_numpy(pt))
+        
+    def forward(self):
+        #obj_nl = cp.log(cp.multiply(np.diag(h)/tmp2, pvar)+1) @ txp
+        obj_nl = torch.log((torch.diag(self.h)/self.tmp2) * self.pvar + 1) @ self.txp
+        #obj_l  = cp.multiply(c, pvar)
+        obj_l  = self.c * self.pvar
+                
+        return -1*(obj_nl+obj_l+self.d) 
+    
+    def ee_eval(self, p):
+        return f_wsee(p, self.h.numpy(), self.mu, self.Pc)
+    
+
+def inner_optim_sgd(pt, h, mu, Pc, Pmax, eps=1e-8, max_iters=10, learning_rate=0.1):
+        
+    # solve innner optim pvar
+    model = grad_solver_1step(pt, h, mu, Pc, Pmax)
+    opt = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    termi = 5
+
+    l = []
+    for i in range(max_iters):
+
+        loss = model()
+        opt.zero_grad()
+        loss.backward(torch.ones(h.shape[-1])) #vector loss
+        opt.step()
+
+        with torch.no_grad():
+            for param in model.parameters():
+                param.clamp_(0, Pmax)
+        
+        l.append(loss.mean().item())
+        if i>termi and l[-termi:].count(l[-termi])==termi:
+            break
+                
+    return model.pvar.detach().numpy()
+
+
+def inner_optim_cvx(pt, h, mu, Pc, Pmax, **kwargs):
+    # e.g. kwargs = {'eps':1e-8, 'max_iters':SolverMaxIter, 'verbose':True}
+    
+    txp, tmp, tmp2, c, d = inner_optim_helper(pt, h, mu, Pc)
+
+    # ----- solve inner problem with cvxpy -----
+    pvar = cp.Variable(pt.shape, nonneg=True)
+    obj_nl = cp.log(cp.multiply(np.diag(h)/tmp2, pvar)+1) @ txp ##
+    obj_l  = cp.multiply(c, pvar)
+
+    objective = cp.Maximize(cp.sum(obj_nl + obj_l + d))
+    constraints = [0 <= pvar, pvar <= Pmax]
+    prob = cp.Problem(objective, constraints)
+    
+#     print('before solver:', pvar.value, pt)
+    prob.solve(requires_grad=True,**kwargs)#, eps=1e-8, max_iters=SolverMaxIter, verbose=True)
+#     print('after solver:', pvar.value, pt,'\n')
+    
+    return pvar.value
+
+
+"""
+SCA MAIN FUNCTION
+"""
+
 it_count1  = []
 
 def SCA(h, mu, Pc, Pmax, pt = None, MaxIter = 10000, SolverMaxIter = 1000,
@@ -40,7 +163,7 @@ def SCA(h, mu, Pc, Pmax, pt = None, MaxIter = 10000, SolverMaxIter = 1000,
         s = h * p # (4,4) * (4,) --> (4,4)
         
         direct = np.diag(s)
-        ifn = 1 + np.sum(s, axis=-1) - direct
+        ifn = np.sum(s, axis=-1) - direct + 1
         rates = np.log(1+direct/ifn)
         ee = rates / (mu * p + Pc)
 
@@ -48,9 +171,13 @@ def SCA(h, mu, Pc, Pmax, pt = None, MaxIter = 10000, SolverMaxIter = 1000,
 
     def gradr(p): # verified
         s = h * p
-        tmp = 1 + np.sum(s, axis=-1) # 1 + sum beta + a
-        tmp2 = tmp - np.diag(s)
-        fac = np.diag(s) / (tmp * tmp2)
+        
+        degr = np.sum(s, axis=-1)
+        diag = np.diag(s)
+        
+        tmp = 1 + degr # 1 + sum beta + a
+        tmp2 = degr - diag + 1
+        fac = diag / (tmp * tmp2)
         
         grad = h.copy()      
         grad = -(fac * grad.T).T
@@ -67,7 +194,7 @@ def SCA(h, mu, Pc, Pmax, pt = None, MaxIter = 10000, SolverMaxIter = 1000,
 
         s = h * p
         direct = np.diag(s)
-        ifn = 1 + np.sum(s, axis=-1) - direct
+        ifn = np.sum(s, axis=-1) - direct + 1
         rates = np.log(1+direct/ifn)
         
         t2 = mu * rates * tmp**2

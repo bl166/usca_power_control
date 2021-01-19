@@ -22,53 +22,60 @@ import sys; sys.path.append(PROJ_RT)
 # from sca import *
 from utils import *
 import dataset as ds
-from models_uf import USCA_MLP, USCA_MLP_R, MLP_ChPm, GCN_ChPt, USCA_GCN
+from models_uf import USCA_MLP, USCA_MLP_R, USCA_GCN, MLP_ChPm, GCN_ChPt
 from trainer import Simple_Trainer, Simple_Trainer_G
 
 
 device = torch.device('cuda')
 
-num_ue = 4
+num_ue = 10
 in_size = 1#num_ue**2 +1 #+ num_ue
 out_size = 1#num_ue
 
 inner_architect = [
-    {'h_sizes': [64, 32, 32, 16, 8],
-     'activs': ['elu', 'relu', 'elu', 'relu', 'elu']},
-#     {'h_sizes': [128, 64, 32, 32, 20, 16, 8], 
+#     {'h_sizes': [32, 16, 8],
+#      'activs': ['elu', 'relu', 'elu']},
+    {'h_sizes': [128, 64, 32, 16, 8], 
+     'activs': ['elu', 'relu', 'elu', 'relu',  'elu']}
+#     {'h_sizes': [16, 64, 32, 16, 8], 
+#      'activs': ['elu', 'relu', 'elu', 'relu',  'elu']},     
+#     {'h_sizes': [16, 64, 128, 64, 32, 16, 8], 
+#      'activs': ['elu', 'relu', 'elu', 'relu', 'elu', 'relu',  'elu']}#,       
+#     {'h_sizes': [128, 64, 32, 32, 32, 16, 8], 
 #      'activs': ['elu', 'relu', 'elu', 'relu', 'elu', 'relu',  'elu']},    
 #     {'h_sizes': [256, 256, 64, 64, 32, 32, 32, 32, 8], 
+#      'activs': ['elu', 'relu', 'elu', 'relu', 'elu', 'relu', 'elu', 'relu',  'elu']}
+#       {'h_sizes': [128, 64, 64, 64, 32, 32, 32, 16, 8], 
 #      'activs': ['elu', 'relu', 'elu', 'relu', 'elu', 'relu', 'elu', 'relu',  'elu']}
 ]
 
 k_fold = 2
 bs = 512
 
-num_outer_layers = [3]#[1,2,3,4,5,7,9] 
+num_outer_layers = [0]#[1,2,3,4,5,7,9] 
 
-learning_rate = 0.001
+learning_rate = 5e-4
 dropout = 0
 l2 = 1e-6
 epochs = 500
 save_freq = 50
-
-init = 'full'
 rseed= 42
-loss_options= [['wsee']]#[['mse'],['wsee'], ['mse','wsee']]
-inner_optim='learned-gcn' 
-# inner_optim='vanilla' 
 
-models = [USCA_GCN]#[GCN_ChPt]
+init = 'full'            # full | rand | last 
+loss_options= [['wsee']] # ['mse'] | ['wsee'] | ['mse+wsee']
+inner_optim='vanilla'    # vanilla | learned-gcn 
+
+models = [GCN_ChPt]      # GCN_ChPt | USCA_GCN 
 trainers = [Simple_Trainer_G]
 
 #--- data---
 
-dfn_tr = PROJ_RT+'../../data/results_hataUrban_noSF.h5' # train / validation data
-X_tr, y_tr, cinfo_tr = ds.load_data(dfn_tr)
+dfn_tr = PROJ_RT+'../../data_my/channels-hataSuburban-10.h5' # train / validation data
+X_tr, y_tr, cinfo_tr = ds.load_data_unsup(dfn_tr)
 print(X_tr.shape, y_tr.shape)
 
-dfn_te = PROJ_RT+'../../data/results_hataUrban.h5' # test data
-X_te, y_te, cinfo_te = ds.load_data(dfn_te)
+dfn_te = PROJ_RT+'../../data_my/channels-hataUrban-10.h5' # test data
+X_te, y_te, cinfo_te = ds.load_data_unsup(dfn_te)
 print(X_te.shape, y_te.shape)
 
 # to torch tensor
@@ -103,6 +110,9 @@ for num_l in num_outer_layers:
 
                 for k, (train_index, valid_index) in enumerate(skf.split(X_tr, np.ones(y_tr.shape[0], dtype=bool))):
 
+                    if k!=0:
+                        continue
+
                     # data loaders
                     loaders_dict = {'tr': (X_tr_[train_index], y_tr[train_index], bs),
                                     'va': (X_tr_[valid_index], y_tr[valid_index], len(valid_index) ),
@@ -118,7 +128,7 @@ for num_l in num_outer_layers:
                         learning_rate=learning_rate, l2=l2, pt_initial=init, loss_funcs= '+'.join(loss_which), 
                         random_state=rseed)
 
-                    save_path = PROJ_RT + 'runs_gcn/' + fix + f'/{k}/'
+                    save_path = PROJ_RT + 'runs_10_sgd/' + fix + f'/{k}/'
                     if not os.path.isdir(save_path):
                         os.makedirs(save_path)
                     check_path = save_path + 'model.pt'
@@ -128,18 +138,17 @@ for num_l in num_outer_layers:
                     print(save_path)
 
 #                     # instantiate model      
-                    model = MODEL(num_layers = num_l, in_size = in_size, out_size = out_size, **arc, 
-                                  channel_info = cinfo_tr, dropout = dropout, inner_optim = inner_optim).to(device)
+#                     model = MODEL(num_layers = num_l, in_size = 1, out_size = 1, **arc, 
+#                                   channel_info = cinfo_tr, dropout = dropout, inner_optim = inner_optim).to(device)
 #                     model = MODEL(in_size = in_size, out_size = out_size, **arc, dropout=dropout).to(device)
-#                     model = MODEL(in_size=1, out_size=1, **arc, channel_info = cinfo_tr).to(device)
+                    model = MODEL(in_size=1, out_size=1, **arc, channel_info = cinfo_tr).to(device)
                     num_params = count_parameters(model, 1)
-#                     raise
 
                     # optimization method
                     optimizer = torch.optim.Adam(model.parameters(), lr = learning_rate)
 
                     # construct the trainer and get loaders
-                    trainer = TRAINER(model, check_path, optimizer, resume = True, l2 = l2, display_step = 20)
+                    trainer = TRAINER(model, check_path, optimizer, resume = True, l2 = l2, display_step = 5, mode='UNSUP')
                     loaders = trainer.get_loaders(loaders_dict)
 
                     print([len(v) for v in loaders.values()])
@@ -176,5 +185,6 @@ for num_l in num_outer_layers:
                     trainer._save_latest()
 
                     model, trainer = None, None
+                    torch.cuda.empty_cache()
                     gc.collect()
 
