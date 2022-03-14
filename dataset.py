@@ -40,21 +40,30 @@ def load_data(dpath):
 def load_data_unsup(dpath, **kwargs):
     # parameters; ref: https://github.com/bmatthiesen/deep-EE-opt/blob/062093fde6b3c6edbb8aa83462165265deefce1a/src/globalOpt/run_wsee.py#L30
     extract_args = lambda a, k: a if not k in kwargs else kwargs[k]
-    PdB = extract_args(np.array(range(-40,10+1,1)), 'PdB')
+    PdB = extract_args(np.array(range(-40,10+1,1)), 'PdB')   
+    
     mu = extract_args(4.0, 'mu')
     Pc = extract_args(1.0, 'Pc')
+    hxp = extract_args(True, 'hxp')
+    num_stab = extract_args(0., 'num_stab')    
+    
+    Plin = 10**(PdB/10)
+    if hxp:
+        Ph = Plin
+    else:
+        Ph = torch.empty(Plin.shape).fill_(1)
     
     X = []
     with h5py.File(dpath, "r") as handle:
         Hs = handle['input']["channel_to_noise_matched"]
-        Plin = 10**(PdB/10)
         
         ns, nu, _ = Hs.shape # eg:(1000,4,4)
 
         for hidx in range(ns):
             edge_index, h = dense_to_sparse(torch.from_numpy(Hs[hidx].astype(float)))
+            h += num_stab
             
-            x1 = np.hstack([(h.reshape((-1,1))*Plin).T, # -->(h1p1, h2p1, h3p1, ...)
+            x1 = np.hstack([(h.reshape((-1,1))*Ph).T, # -->(h1p1, h2p1, h3p1, ...)
                              Plin.reshape(-1,1)])
             X.append( x1 )
             
